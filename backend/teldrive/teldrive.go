@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/uuid"
 	"github.com/rclone/rclone/backend/teldrive/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -64,22 +65,31 @@ func init() {
 			Help:     "Randomise part",
 			Advanced: true,
 		}, {
+			Name:      "channel_id",
+			Help:      "Channel ID",
+			Sensitive: true,
+		}, {
 			Name:     "upload_concurrency",
 			Default:  4,
 			Help:     "Upload Concurrency",
 			Advanced: true,
-		}, {
+		},
+			{
+				Name:    "encrypt_files",
+				Default: false,
+				Help:    "Enable Native  Teldrive Encryption",
+			}, {
 
-			Name:     config.ConfigEncoding,
-			Help:     config.ConfigEncodingHelp,
-			Advanced: true,
-			Default: (encoder.Display |
-				encoder.EncodeBackQuote |
-				encoder.EncodeDoubleQuote |
-				encoder.EncodeLtGt |
-				encoder.EncodeLeftSpace |
-				encoder.EncodeInvalidUtf8),
-		}},
+				Name:     config.ConfigEncoding,
+				Help:     config.ConfigEncodingHelp,
+				Advanced: true,
+				Default: (encoder.Display |
+					encoder.EncodeBackQuote |
+					encoder.EncodeDoubleQuote |
+					encoder.EncodeLtGt |
+					encoder.EncodeLeftSpace |
+					encoder.EncodeInvalidUtf8),
+			}},
 	})
 }
 
@@ -90,6 +100,8 @@ type Options struct {
 	ChunkSize         fs.SizeSuffix        `config:"chunk_size"`
 	RandomisePart     bool                 `config:"randomise_part"`
 	UploadConcurrency int                  `config:"upload_concurrency"`
+	ChannelID         int64                `config:"channel_id"`
+	EncryptFiles      bool                 `config:"encrypt_files"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -190,23 +202,6 @@ func (f *Fs) splitPathFull(pth string) (string, string) {
 	return "/" + fullPath[:i], fullPath[i+1:]
 }
 
-// splitPath is modified splitPath version that doesn't include the separator
-// in the base path
-func (f *Fs) splitPath(pth string) (string, string) {
-	// chop of any leading or trailing '/'
-	pth = strings.Trim(pth, "/")
-
-	i := len(pth) - 1
-	for i >= 0 && pth[i] != '/' {
-		i--
-	}
-
-	if i < 0 {
-		return pth[:i+1], pth[i+1:]
-	}
-	return pth[:i], pth[i+1:]
-}
-
 func checkUploadChunkSize(cs fs.SizeSuffix) error {
 	if cs < minChunkSize {
 		return fmt.Errorf("ChunkSize: %s is less than %s", cs, minChunkSize)
@@ -266,12 +261,17 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		Path:   "/api/auth/session",
 	}
 
-	var session api.Session
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.CallJSON(ctx, &opts, nil, &session)
-		return shouldRetry(ctx, resp, err)
-	})
+	var
+	(
+		session api.Session
+		sessionResp *http.Response
+	)
 
+	err = f.pacer.Call(func() (bool, error) {
+		sessionResp, err = f.srv.CallJSON(ctx, &opts, nil, &session)
+		return shouldRetry(ctx, sessionResp, err)
+	})
+	
 	if err != nil {
 		return nil, err
 	}
@@ -280,18 +280,24 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		return nil, fmt.Errorf("invalid session token")
 	}
 
+	for _, cookie := range sessionResp.Cookies() {
+		if cookie.Name == "user-session" {
+			config.Set("access_token", cookie.Value)
+		}
+	}
+
 	f.authHash = session.Hash
 
-	dir, base := f.splitPath(f.root)
+	dir, base := f.splitPathFull("")
 
-	res, err := f.findObject(ctx, "/"+dir, base)
+	res, err := f.findObject(ctx, dir, base)
 
 	if err != nil && !errors.Is(err, fs.ErrorDirNotFound) {
 		return nil, err
 	}
 
 	if res != nil && len(res.Files) == 1 && res.Files[0].Type == "file" {
-		f.root = dir
+		f.root = strings.Trim(dir, "/")
 		return f, fs.ErrorIsFile
 	}
 
@@ -490,7 +496,9 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 // returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
-	res, err := f.findObject(ctx, path.Dir(f.dirPath(remote)), remote)
+	base, leaf := f.splitPathFull(remote)
+
+	res, err := f.findObject(ctx, base, leaf)
 
 	if err != nil {
 		// need to change error type
@@ -512,7 +520,7 @@ func (f *Fs) move(ctx context.Context, dstPath string, fileID string) (err error
 
 	opts := rest.Opts{
 		Method: "POST",
-		Path:   "/api/files/movefiles",
+		Path:   "/api/files/move",
 	}
 
 	mv := api.MoveFileRequest{
@@ -559,63 +567,80 @@ func MD5(text string) string {
 
 func (f *Fs) putUnchecked(ctx context.Context, in0 io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 
-	base, leaf := f.splitPath(src.Remote())
-	fullBase := f.dirPath(base)
+	base, leaf := f.splitPathFull(src.Remote())
 
 	modTime := src.ModTime(ctx).UTC().Format(timeFormat)
-	uploadID := MD5(fmt.Sprintf("%s:%d:%s", path.Join(fullBase, leaf), src.Size(), modTime))
 
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/api/uploads/" + uploadID,
-	}
-
-	var uploadFile api.UploadFile
-	err := f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.CallJSON(ctx, &opts, nil, &uploadFile)
-		return shouldRetry(ctx, resp, err)
-	})
-
-	if err != nil {
-		return fmt.Errorf("upload not found: %w", err)
-	}
-
-	uploadedSize := int64(0)
-
-	if len(uploadFile.Parts) != 0 {
-		for _, part := range uploadFile.Parts {
-			uploadedSize += part.Size
-		}
-	}
+	uploadID := MD5(fmt.Sprintf("%s:%d:%s", path.Join(base, leaf), src.Size(), modTime))
 
 	chunkSize := int64(f.opt.ChunkSize)
 
-	// Calculate total parts and chunk size
+	var existingParts map[int]api.PartFile
+
+	var uploadFile api.UploadFile
+
+	if chunkSize < src.Size() {
+		opts := rest.Opts{
+			Method: "GET",
+			Path:   "/api/uploads/" + uploadID,
+		}
+
+		err := f.pacer.Call(func() (bool, error) {
+			resp, err := f.srv.CallJSON(ctx, &opts, nil, &uploadFile)
+			return shouldRetry(ctx, resp, err)
+		})
+
+		if err == nil {
+			existingParts = make(map[int]api.PartFile, len(uploadFile.Parts))
+			for _, part := range uploadFile.Parts {
+				existingParts[part.PartNo] = part
+			}
+		}
+	}
+
 	totalParts := src.Size() / chunkSize
 
 	if src.Size()%chunkSize != 0 {
 		totalParts++
 	}
 
-	// Create a buffered reader
+	var partsToCommit []api.PartFile
+
+	var uploadedSize int64
+
 	in := bufio.NewReader(in0)
 
-	// Skip any previously uploaded data
-	if uploadedSize > 0 {
-		io.CopyN(io.Discard, in, uploadedSize)
+	channelID := f.opt.ChannelID
+
+	encryptFile := f.opt.EncryptFiles
+
+	if len(uploadFile.Parts) > 0 {
+		channelID = uploadFile.Parts[0].ChannelID
+
+		encryptFile = uploadFile.Parts[0].Encrypted
 	}
 
-	name := leaf
+	var partName string
 
-	// Upload the remaining parts
-	for partNo := len(uploadFile.Parts) + 1; partNo <= int(totalParts); partNo++ {
+	for partNo := 1; partNo <= int(totalParts); partNo++ {
+
+		if existing, ok := existingParts[partNo]; ok {
+			io.CopyN(io.Discard, in, existing.Size)
+			partsToCommit = append(partsToCommit, existing)
+			uploadedSize += existing.Size
+			continue
+		}
+
 		if partNo == int(totalParts) {
 			chunkSize = src.Size() - uploadedSize
 		}
 		partReader := io.LimitReader(in, chunkSize)
 
-		if totalParts > 1 {
-			name = fmt.Sprintf("%s.part.%03d", name, partNo)
+		if f.opt.RandomisePart {
+			u1, _ := uuid.NewV4()
+			partName = hex.EncodeToString(u1.Bytes())
+		} else if totalParts > 1 {
+			partName = fmt.Sprintf("%s.part.%03d", leaf, partNo)
 		}
 
 		opts := rest.Opts{
@@ -624,9 +649,11 @@ func (f *Fs) putUnchecked(ctx context.Context, in0 io.Reader, src fs.ObjectInfo,
 			Body:          partReader,
 			ContentLength: &chunkSize,
 			Parameters: url.Values{
-				"fileName":   []string{name},
-				"partNo":     []string{strconv.Itoa(partNo)},
-				"totalparts": []string{strconv.FormatInt(totalParts, 10)},
+				"partName":  []string{partName},
+				"fileName":  []string{leaf},
+				"partNo":    []string{strconv.Itoa(partNo)},
+				"channelId": []string{strconv.FormatInt(channelID, 10)},
+				"encrypted": []string{strconv.FormatBool(encryptFile)},
 			},
 		}
 
@@ -639,36 +666,39 @@ func (f *Fs) putUnchecked(ctx context.Context, in0 io.Reader, src fs.ObjectInfo,
 			return err
 		}
 		uploadedSize += chunkSize
-		uploadFile.Parts = append(uploadFile.Parts, info)
+
+		partsToCommit = append(partsToCommit, info)
 	}
 
-	if fullBase != "/" {
-		err := f.Mkdir(ctx, base)
+	if base != "/" {
+		err := f.CreateDir(ctx, base, "")
 		if err != nil {
 			return err
 		}
 	}
 
-	opts = rest.Opts{
+	opts := rest.Opts{
 		Method: "POST",
 		Path:   "/api/files",
 	}
 
 	fileParts := []api.FilePart{}
 
-	for _, part := range uploadFile.Parts {
-		fileParts = append(fileParts, api.FilePart{ID: part.PartId})
+	for _, part := range partsToCommit {
+		fileParts = append(fileParts, api.FilePart{ID: part.PartId, Salt: part.Salt})
 	}
 
 	payload := api.CreateFileRequest{
-		Name:     f.opt.Enc.FromStandardName(leaf),
-		Type:     "file",
-		Path:     fullBase,
-		MimeType: fs.MimeType(ctx, src),
-		Size:     src.Size(),
-		Parts:    fileParts,
+		Name:      f.opt.Enc.FromStandardName(leaf),
+		Type:      "file",
+		Path:      base,
+		MimeType:  fs.MimeType(ctx, src),
+		Size:      src.Size(),
+		Parts:     fileParts,
+		ChannelID: channelID,
+		Encrypted: encryptFile,
 	}
-	err = f.pacer.Call(func() (bool, error) {
+	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, &opts, &payload, nil)
 		return shouldRetry(ctx, resp, err)
 	})
@@ -804,6 +834,8 @@ func (f *Fs) OpenChunkWriter(
 		src:           src,
 		o:             o,
 		totalParts:    totalParts,
+		channelID:     ui.channelID,
+		encryptFile:   ui.encryptFile,
 	}
 	info = fs.ChunkWriterInfo{
 		ChunkSize:         int64(chunkSize),
@@ -822,7 +854,7 @@ func (f *Fs) CreateDir(ctx context.Context, base string, leaf string) (err error
 	var apiErr api.Error
 	opts := rest.Opts{
 		Method: "POST",
-		Path:   "/api/files/makedir",
+		Path:   "/api/files/directories",
 	}
 
 	dir := base
@@ -860,23 +892,19 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) (err error) {
 // may or may not delete folders with contents?
 func (f *Fs) purge(ctx context.Context, folderID string) (err error) {
 	var resp *http.Response
-	var apiErr api.Error
 	opts := rest.Opts{
 		Method: "POST",
-		Path:   "/api/files/deletefiles",
+		Path:   "/api/files/delete",
 	}
 	rm := api.RemoveFileRequest{
 		Files: []string{folderID},
 	}
 	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, &rm, &apiErr)
+		resp, err = f.srv.CallJSON(ctx, &opts, &rm, nil)
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
-	}
-	if !apiErr.Status {
-		return fs.ErrorCantPurge
 	}
 	return nil
 }
@@ -886,7 +914,7 @@ func (f *Fs) purge(ctx context.Context, folderID string) (err error) {
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	info, err := f.getPathInfo(ctx, f.dirPath(dir))
-	if err != nil || len(info.Files) == 0 {
+	if err != nil {
 		return err
 	}
 	return f.purge(ctx, info.Files[0].Id)
@@ -965,7 +993,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 	opts := rest.Opts{
 		Method: "POST",
-		Path:   "/api/files/movedir",
+		Path:   "/api/files/directories/move",
 	}
 	move := api.DirMove{
 		Source:      srcPath,
@@ -983,6 +1011,25 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
+func (o *Object) Remove(ctx context.Context) error {
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/api/files/delete",
+	}
+	delete := api.RemoveFileRequest{
+		Files: []string{o.id},
+	}
+	var info api.UpdateResponse
+	err := o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, &delete, &info)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	var resp *http.Response
@@ -992,7 +1039,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	fs.FixRangeOption(options, o.size)
 	opts := rest.Opts{
 		Method:  "GET",
-		Path:    fmt.Sprintf("/api/files/%s/%s", o.id, o.name),
+		Path:    fmt.Sprintf("/api/files/%s/stream/%s", o.id, url.QueryEscape(o.name)),
 		Options: options,
 		Parameters: url.Values{
 			"hash": []string{o.fs.authHash},
@@ -1010,13 +1057,50 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	return resp.Body, err
 }
 
-// Copy src to this remote using server side move operations.
+// Copy src to this remote using server-side copy operations.
+//
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't copy - not same remote type")
+		return nil, fs.ErrorCantCopy
+	}
 
-	return nil, nil
+	dstBase, dstLeaf := f.splitPathFull(remote)
+
+	srcBase, srcLeaf := srcObj.fs.splitPathFull(src.Remote())
+
+	if dstBase == srcBase && dstLeaf == srcLeaf {
+		fs.Debugf(src, "Can't copy - change file name")
+		return nil, fs.ErrorCantCopy
+	}
+
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/api/files/copy",
+	}
+	copy := api.CopyFile{
+		ID:          srcObj.id,
+		Name:        dstLeaf,
+		Destination: dstBase,
+	}
+	var info api.FileInfo
+	err := f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, &copy, &info)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return f.newObjectWithInfo(ctx, remote, &info)
 }
-
-// ------------------------------------------------------------
 
 // Fs returns the parent Fs
 func (o *Object) Fs() fs.Info {
@@ -1072,28 +1156,6 @@ func (o *Object) Storable() bool {
 // SetModTime sets the modification time of the local fs object
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	return fs.ErrorCantSetModTime
-}
-
-func (o *Object) Remove(ctx context.Context) error {
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/api/files/deletefiles",
-	}
-	delete := api.RemoveFileRequest{
-		Files: []string{o.id},
-	}
-	var info api.UpdateResponse
-	err := o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.CallJSON(ctx, &opts, &delete, &info)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return err
-	}
-	if !info.Status {
-		return fmt.Errorf("remove: api error: %s", info.Message)
-	}
-	return nil
 }
 
 // Check the interfaces are satisfied

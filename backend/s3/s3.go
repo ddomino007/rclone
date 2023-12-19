@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -139,6 +140,9 @@ var providerOption = fs.Option{
 	}, {
 		Value: "RackCorp",
 		Help:  "RackCorp Object Storage",
+	}, {
+		Value: "Rclone",
+		Help:  "Rclone S3 Server",
 	}, {
 		Value: "Scaleway",
 		Help:  "Scaleway Object Storage",
@@ -2423,6 +2427,19 @@ See [the time option docs](/docs/#time-option) for valid formats.
 			Default:  fs.Time{},
 			Advanced: true,
 		}, {
+			Name: "version_deleted",
+			Help: `Show deleted file markers when using versions.
+
+This shows deleted file markers in the listing when using versions. These will appear
+as 0 size files. The only operation which can be performed on them is deletion.
+
+Deleting a delete marker will reveal the previous version.
+
+Deleted files will always show with a timestamp.
+`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name: "decompress",
 			Help: `If set this will decompress gzip encoded objects.
 
@@ -2513,6 +2530,18 @@ ignores the |BucketAlreadyExists| error which can lead to confusion.
 This should be automatically set correctly for all providers rclone
 knows about - please make a bug report if not.
 `, "|", "`"),
+			Default:  fs.Tristate{},
+			Advanced: true,
+		}, {
+			Name: "use_multipart_uploads",
+			Help: `Set if rclone should use multipart uploads.
+
+You can change this if you want to disable the use of multipart uploads.
+This shouldn't be necessary in normal operation.
+
+This should be automatically set correctly for all providers rclone
+knows about - please make a bug report if not.
+`,
 			Default:  fs.Tristate{},
 			Advanced: true,
 		},
@@ -2637,11 +2666,13 @@ type Options struct {
 	UsePresignedRequest   bool                 `config:"use_presigned_request"`
 	Versions              bool                 `config:"versions"`
 	VersionAt             fs.Time              `config:"version_at"`
+	VersionDeleted        bool                 `config:"version_deleted"`
 	Decompress            bool                 `config:"decompress"`
 	MightGzip             fs.Tristate          `config:"might_gzip"`
 	UseAcceptEncodingGzip fs.Tristate          `config:"use_accept_encoding_gzip"`
 	NoSystemMetadata      bool                 `config:"no_system_metadata"`
 	UseAlreadyExists      fs.Tristate          `config:"use_already_exists"`
+	UseMultipartUploads   fs.Tristate          `config:"use_multipart_uploads"`
 }
 
 // Fs represents a remote s3 server
@@ -2987,9 +3018,19 @@ func checkUploadCutoff(cs fs.SizeSuffix) error {
 }
 
 func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
-	err = checkUploadCutoff(cs)
+	if f.opt.Provider != "Rclone" {
+		err = checkUploadCutoff(cs)
+	}
 	if err == nil {
 		old, f.opt.UploadCutoff = f.opt.UploadCutoff, cs
+	}
+	return
+}
+
+func (f *Fs) setCopyCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
+	err = checkUploadChunkSize(cs)
+	if err == nil {
+		old, f.opt.CopyCutoff = f.opt.CopyCutoff, cs
 	}
 	return
 }
@@ -3042,6 +3083,7 @@ func setQuirks(opt *Options) {
 		useAcceptEncodingGzip = true // Set Accept-Encoding: gzip
 		mightGzip             = true // assume all providers might use content encoding gzip until proven otherwise
 		useAlreadyExists      = true // Set if provider returns AlreadyOwnedByYou or no error if you try to remake your own bucket
+		useMultipartUploads   = true // Set if provider supports multipart uploads
 	)
 	switch opt.Provider {
 	case "AWS":
@@ -3116,6 +3158,13 @@ func setQuirks(opt *Options) {
 		// No quirks
 		useMultipartEtag = false // untested
 		useAlreadyExists = false // untested
+	case "Rclone":
+		listObjectsV2 = true
+		urlEncodeListings = true
+		virtualHostStyle = false
+		useMultipartEtag = false
+		useAlreadyExists = false
+		// useMultipartUploads = false - set this manually
 	case "Scaleway":
 		// Scaleway can only have 1000 parts in an upload
 		if opt.MaxUploadParts > 1000 {
@@ -3215,6 +3264,16 @@ func setQuirks(opt *Options) {
 		opt.UseAlreadyExists.Valid = true
 		opt.UseAlreadyExists.Value = useAlreadyExists
 	}
+
+	// Set the correct use multipart uploads if not manually set
+	if !opt.UseMultipartUploads.Valid {
+		opt.UseMultipartUploads.Valid = true
+		opt.UseMultipartUploads.Value = useMultipartUploads
+	}
+	if !opt.UseMultipartUploads.Value {
+		opt.UploadCutoff = math.MaxInt64
+	}
+
 }
 
 // setRoot changes the root of the Fs
@@ -3327,6 +3386,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.features.CanHaveEmptyDirectories = true
 	}
 	// f.listMultipartUploads()
+	if !opt.UseMultipartUploads.Value {
+		fs.Debugf(f, "Disabling multipart uploads")
+		f.features.OpenChunkWriter = nil
+	}
 
 	if f.rootBucket != "" && f.rootDirectory != "" && !opt.NoHeadObject && !strings.HasSuffix(root, "/") {
 		// Check to see if the (bucket,directory) is actually an existing file
@@ -3371,6 +3434,7 @@ func (f *Fs) getMetaDataListing(ctx context.Context, wantRemote string) (info *s
 		withVersions: f.opt.Versions,
 		findFile:     true,
 		versionAt:    f.opt.VersionAt,
+		hidden:       f.opt.VersionDeleted,
 	}, func(gotRemote string, object *s3.Object, objectVersionID *string, isDirectory bool) error {
 		if isDirectory {
 			return nil
@@ -3432,6 +3496,10 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *s3.Obje
 		o.bytes = aws.Int64Value(info.Size)
 		o.storageClass = stringClonePointer(info.StorageClass)
 		o.versionID = stringClonePointer(versionID)
+		// If is delete marker, show that metadata has been read as there is none to read
+		if info.Size == isDeleteMarker {
+			o.meta = map[string]string{}
+		}
 	} else if !o.fs.opt.NoHeadObject {
 		err := o.readMetaData(ctx) // reads info and meta, returning an error
 		if err != nil {
@@ -3682,6 +3750,9 @@ func (ls *versionsList) List(ctx context.Context) (resp *s3.ListObjectsV2Output,
 	// Set up the request for next time
 	ls.req.KeyMarker = respVersions.NextKeyMarker
 	ls.req.VersionIdMarker = respVersions.NextVersionIdMarker
+	if aws.BoolValue(respVersions.IsTruncated) && ls.req.KeyMarker == nil {
+		return nil, nil, errors.New("s3 protocol error: received versions listing with IsTruncated set with no NextKeyMarker")
+	}
 
 	// If we are URL encoding then must decode the marker
 	if ls.req.KeyMarker != nil && ls.req.EncodingType != nil {
@@ -3726,7 +3797,7 @@ func (ls *versionsList) List(ctx context.Context) (resp *s3.ListObjectsV2Output,
 		//structs.SetFrom(obj, objVersion)
 		setFrom_s3Object_s3ObjectVersion(obj, objVersion)
 		// Adjust the file names
-		if !ls.usingVersionAt && !aws.BoolValue(objVersion.IsLatest) {
+		if !ls.usingVersionAt && (!aws.BoolValue(objVersion.IsLatest) || objVersion.Size == isDeleteMarker) {
 			if obj.Key != nil && objVersion.LastModified != nil {
 				*obj.Key = version.Add(*obj.Key, *objVersion.LastModified)
 			}
@@ -3994,6 +4065,7 @@ func (f *Fs) listDir(ctx context.Context, bucket, directory, prefix string, addB
 		addBucket:    addBucket,
 		withVersions: f.opt.Versions,
 		versionAt:    f.opt.VersionAt,
+		hidden:       f.opt.VersionDeleted,
 	}, func(remote string, object *s3.Object, versionID *string, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(ctx, remote, object, versionID, isDirectory)
 		if err != nil {
@@ -4080,6 +4152,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			recurse:      true,
 			withVersions: f.opt.Versions,
 			versionAt:    f.opt.VersionAt,
+			hidden:       f.opt.VersionDeleted,
 		}, func(remote string, object *s3.Object, versionID *string, isDirectory bool) error {
 			entry, err := f.itemToDirEntry(ctx, remote, object, versionID, isDirectory)
 			if err != nil {
@@ -4846,6 +4919,7 @@ func (f *Fs) restoreStatus(ctx context.Context, all bool) (out []restoreStatusOu
 		recurse:       true,
 		withVersions:  f.opt.Versions,
 		versionAt:     f.opt.VersionAt,
+		hidden:        f.opt.VersionDeleted,
 		restoreStatus: true,
 	}, func(remote string, object *s3.Object, versionID *string, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(ctx, remote, object, versionID, isDirectory)
@@ -5969,7 +6043,7 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 	}
 
 	// Fetch metadata if --metadata is in use
-	meta, err := fs.GetMetadataOptions(ctx, src, options)
+	meta, err := fs.GetMetadataOptions(ctx, o.fs, src, options)
 	if err != nil {
 		return ui, fmt.Errorf("failed to read metadata from source object: %w", err)
 	}

@@ -325,6 +325,37 @@ file.
 `,
 			Advanced: true,
 		}, {
+			Name:    "delta",
+			Default: false,
+			Help: strings.ReplaceAll(`If set rclone will use delta listing to implement recursive listings.
+
+If this flag is set the the onedrive backend will advertise |ListR|
+support for recursive listings.
+
+Setting this flag speeds up these things greatly:
+
+    rclone lsf -R onedrive:
+    rclone size onedrive:
+    rclone rc vfs/refresh recursive=true
+
+**However** the delta listing API **only** works at the root of the
+drive. If you use it not at the root then it recurses from the root
+and discards all the data that is not under the directory you asked
+for. So it will be correct but may not be very efficient.
+
+This is why this flag is not set as the default.
+
+As a rule of thumb if nearly all of your data is under rclone's root
+directory (the |root/directory| in |onedrive:root/directory|) then
+using this flag will be be a big performance win. If your data is
+mostly not under the root then using this flag will be a big
+performance loss.
+
+It is recommended if you are mounting your onedrive at the root
+(or near the root when using crypt) and using rclone |rc vfs/refresh|.
+`, "|", "`"),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -645,6 +676,7 @@ type Options struct {
 	LinkPassword            string               `config:"link_password"`
 	HashType                string               `config:"hash_type"`
 	AVOverride              bool                 `config:"av_override"`
+	Delta                   bool                 `config:"delta"`
 	Enc                     encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -976,6 +1008,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	f.dirCache = dircache.New(root, rootID, f)
 
+	// ListR only supported if delta set
+	if !f.opt.Delta {
+		f.features.ListR = nil
+	}
+
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
@@ -1204,10 +1241,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 	err = f.listAll(ctx, directoryID, false, false, func(info *api.Item) error {
 		entry, err := f.itemToDirEntry(ctx, dir, info)
-		if err == nil {
-			entries = append(entries, entry)
+		if err != nil {
+			return err
 		}
-		return err
+		if entry == nil {
+			return nil
+		}
+		entries = append(entries, entry)
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -1301,6 +1342,9 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 		entry, err := f.itemToDirEntry(ctx, parentPath, info)
 		if err != nil {
 			return err
+		}
+		if entry == nil {
+			return nil
 		}
 		err = list.Add(entry)
 		if err != nil {
