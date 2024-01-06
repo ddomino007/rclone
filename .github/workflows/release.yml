@@ -2,9 +2,10 @@ name: release
 
 on:
   push:
-    tags:
-      - '**'
-
+    # tags:
+    #   - '**'
+    branches:
+      - main
 jobs:
   build:
     timeout-minutes: 60
