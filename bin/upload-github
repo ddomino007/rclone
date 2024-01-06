@@ -6,7 +6,7 @@
 
 set -e
 
-REPO="divyam234/rclone"
+REPO=$GITHUB_REPOSITORY
 
 if [ "$1" == "" ]; then
     echo "Syntax: $0 Version"

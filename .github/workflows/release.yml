@@ -41,7 +41,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
@@ -106,9 +106,9 @@ jobs:
           make cross
 
       - name: Upload Binary
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: rclone
+          name: rclone-${{ matrix.job_name }}
           path: ${{ github.workspace }}/build/**/*
 
   release:
@@ -121,9 +121,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
-         name: rclone
+         name: rclone-windows
+         path: ${{ github.workspace }}/build
+
+      - uses: actions/download-artifact@v4
+        with:
+         name: rclone-linux
          path: ${{ github.workspace }}/build
 
       - name: Upload Assets
