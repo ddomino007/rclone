@@ -14,7 +14,7 @@ import (
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/vfpackage services"
-
+)
 import (
 	"context"
 	"encoding/base64"
