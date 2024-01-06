@@ -82,6 +82,7 @@ jobs:
           go get go.uber.org/zap
           go get gorm.io/gorm
           go get gorm.io/gorm/clause
+          go mod tidy
         if: matrix.os == 'ubuntu-latest'
 
       - name: Install Libraries on Windows
@@ -115,6 +116,7 @@ jobs:
           go get go.uber.org/zap
           go get gorm.io/gorm
           go get gorm.io/gorm/clause
+          go mod tidy
           $path = (get-command mingw32-make.exe).Path
           Copy-Item -Path $path -Destination (Join-Path (Split-Path -Path $path) 'make.exe')
         if: matrix.os == 'windows-latest'
