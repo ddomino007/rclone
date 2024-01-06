@@ -63,6 +63,25 @@ jobs:
           sudo chmod 666 /dev/fuse
           sudo chown root:$USER /etc/fuse.conf
           sudo apt-get install fuse3 libfuse-dev rpm pkg-config
+          go get github.com/divyam234/teldrive/config
+          go get github.com/divyam234/teldrive/internal/cache
+          go get github.com/divyam234/teldrive/internal/http_range
+          go get github.com/divyam234/teldrive/internal/md5
+          go get github.com/divyam234/teldrive/internal/reader
+          go get github.com/divyam234/teldrive/internal/tgc
+          go get github.com/divyam234/teldrive/internal/utils
+          go get github.com/divyam234/teldrive/pkg/mapper
+          go get github.com/divyam234/teldrive/pkg/models
+          go get github.com/divyam234/teldrive/pkg/schemas
+          go get github.com/divyam234/teldrive/pkg/types
+          go mod download github.com/gin-gonic/gin
+          go get github.com/gotd/td/tg
+          go get github.com/jackc/pgx/v5/pgconn
+          go get github.com/jackc/pgx/v5/pgtype
+          go get github.com/mitchellh/mapstructure
+          go get go.uber.org/zap
+          go get gorm.io/gorm
+          go get gorm.io/gorm/clause
         if: matrix.os == 'ubuntu-latest'
 
       - name: Install Libraries on Windows
